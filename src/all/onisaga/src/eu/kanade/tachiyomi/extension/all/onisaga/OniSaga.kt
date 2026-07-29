@@ -44,6 +44,7 @@ import okhttp3.Request
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import kotlin.time.Duration.Companion.milliseconds
 
 @Source
 abstract class OniSaga :
@@ -627,6 +628,22 @@ abstract class OniSaga :
         }
     }
 
+    private suspend fun awaitRateLimit(forcedDelay: Long? = null) {
+        apiLock.withLock {
+            if (forcedDelay != null) {
+                delay(forcedDelay.milliseconds)
+            } else {
+                val rateLimitDelay = preferences.getString(PREF_RATE_LIMIT_KEY, "2500")?.toLongOrNull() ?: 2500L
+                val now = System.currentTimeMillis()
+                val waitTime = (rateLimitDelay - (now - lastRequestTime)).coerceAtLeast(0L)
+                // Using rateLimit from keiyoushi.network.rateLimit was too aggressive, leading to 429 errors when it was fine after the rest of the images loaded
+                // Note: Error 429 lasts for approximately 15-30 minutes. Had to jump between many VPN servers to reach this conclusion
+                if (waitTime > 0) delay(waitTime.milliseconds)
+            }
+            lastRequestTime = System.currentTimeMillis()
+        }
+    }
+
     override suspend fun getImageUrl(page: Page): String {
         val chapterUrl = page.url.substringBefore("#")
         val cid = chapterUrl.toHttpUrl().pathSegments.last()
@@ -639,27 +656,18 @@ abstract class OniSaga :
         while (attempt < 3) {
             attempt++
 
-            apiLock.withLock {
-                val rateLimitDelay = preferences.getString(PREF_RATE_LIMIT_KEY, "2000")?.toLongOrNull() ?: 2000L
-                val now = System.currentTimeMillis()
-                val waitTime = (rateLimitDelay - (now - lastRequestTime)).coerceAtLeast(0L)
-                // Using rateLimit from keiyoushi.network.rateLimit was too aggressive, leading to 429 errors when it was fine after the rest of the images loaded
-                // Note: Error 429 lasts for approximately 15-30 minutes. Had to jump between many VPN servers to reach this conclusion
-                if (waitTime > 0) delay(waitTime)
-                lastRequestTime = System.currentTimeMillis()
-            }
+            awaitRateLimit()
 
             val response = client.get(apiUrl, apiHeaders(token, chapterUrl), ensureSuccess = false)
 
             // Handle 429 just in case (still holding the lock)
             if (response.code == 429) {
-                val rateLimitDelay = preferences.getString(PREF_RATE_LIMIT_KEY, "2000")?.toLongOrNull() ?: 2000L
+                val rateLimitDelay = preferences.getString(PREF_RATE_LIMIT_KEY, "2500")?.toLongOrNull() ?: 2500L
                 val retryAfter = response.header("retry-after")?.toLongOrNull()?.times(1000L) ?: rateLimitDelay
                 response.close()
-                apiLock.withLock {
-                    delay(retryAfter)
-                    lastRequestTime = System.currentTimeMillis()
-                }
+
+                awaitRateLimit(retryAfter)
+                attempt--
                 continue
             }
 
@@ -675,6 +683,8 @@ abstract class OniSaga :
             }
 
             if (!response.isSuccessful || dto.message?.contains("expired", ignoreCase = true) == true) {
+                awaitRateLimit()
+
                 val refreshBody = client.get(chapterUrl).body.string()
                 val newToken = READER_TOKEN_REGEX.find(refreshBody)?.groupValues?.get(1)
 
@@ -832,10 +842,10 @@ abstract class OniSaga :
         val rateLimitPref = ListPreference(screen.context).apply {
             key = PREF_RATE_LIMIT_KEY
             title = "Image Requests Limit"
-            entries = arrayOf("1 image per 1.50 seconds", "1 image per 1.75 seconds", "1 image per 2.00 seconds", "1 image per 2.25 seconds", "1 image per 2.50 seconds")
-            entryValues = arrayOf("1500", "1750", "2000", "2250", "2500")
-            setDefaultValue("2000")
-            summary = "%s\nWarning: Lowering this might cause 429 errors."
+            entries = arrayOf("1 image per 2.50 seconds", "1 image per 2.75 seconds", "1 image per 3.00 seconds", "1 image per 3.25 seconds", "1 image per 3.50 seconds")
+            entryValues = arrayOf("2500", "2750", "3000", "3250", "3500")
+            setDefaultValue("2500")
+            summary = "%s\nWarning: Lowering this might cause issues with chapter images."
         }
         screen.addPreference(rateLimitPref)
     }
@@ -846,7 +856,7 @@ abstract class OniSaga :
         private const val PREF_STATUS_KEY = "pref_status"
         private const val PREF_EXCLUDE_GENRE = "pref_exclude_genre"
         private const val PREF_EXCLUDE_GENRE_ADULT = "pref_exclude_genre_adult"
-        private const val PREF_RATE_LIMIT_KEY = "pref_rate_limit"
+        private const val PREF_RATE_LIMIT_KEY = "pref_rate_limit_v2"
 
         private val READER_TOKEN_REGEX = Regex("""readerToken["']?\s*:\s*["']([^"']+)["']""")
         private val PAGE_ORDER_REGEX = Regex("""["']?order["']?\s*:\s*(\d+)""")
