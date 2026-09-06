@@ -720,7 +720,7 @@ abstract class Mangadotnet :
         }
     }
 
-    private val allOrigins = setOf("JP", "KR", "CN", "ONESHOT")
+    private val allOrigins = setOf("JP", "KR", "CN", "EN", "ONESHOT")
 
     private fun excludedTypesPref(): Set<String> = preferences.getStringSet(BROWSE_TYPE_PREF, emptySet())!!
 
