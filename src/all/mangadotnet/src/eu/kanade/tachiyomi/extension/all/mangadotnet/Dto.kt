@@ -217,6 +217,7 @@ class Manga(
                 "JP" -> add("Manga")
                 "KR" -> add("Manhwa")
                 "CN" -> add("Manhua")
+                "EN" -> add("OEL")
             }
             this@Manga.genres.forEach { add(it.trim()) }
             if (showTags) {
