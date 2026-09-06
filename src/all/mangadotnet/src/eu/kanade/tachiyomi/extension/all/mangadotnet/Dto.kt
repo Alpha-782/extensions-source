@@ -276,7 +276,7 @@ class Manga(
                 mangabakaID?.let { "[MangaBaka](https://mangabaka.org/$it)" },
                 malID?.let { "[MyAnimeList](https://myanimelist.net/manga/$it)" },
                 kitsuID?.let { "[Kitsu](https://kitsu.app/manga/$it)" },
-                animePlanetId?. let { "[AnimePlanet](https://www.anime-planet.com/manga/$it)" },
+                animePlanetId?.let { "[AnimePlanet](https://www.anime-planet.com/manga/$it)" },
                 shikimoriId?.let { "[Shikimori](https://shikimori.io/mangas/$it)" },
                 animeNewsNetworkId?.let { "[AnimeNewsNetwork](https://www.animenewsnetwork.com/encyclopedia/manga.php?id=$it)" },
                 mangadexID?.let { "[MangaDex](https://mangadex.org/title/$it)" },
