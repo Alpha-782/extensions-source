@@ -1,9 +1,11 @@
 package eu.kanade.tachiyomi.extension.ja.soraraw
 
 import androidx.preference.ListPreference
+import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
+import eu.kanade.tachiyomi.source.model.Filter.TriState
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -15,8 +17,7 @@ import keiyoushi.network.get
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferencesLazy
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import keiyoushi.utils.parseAs
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -56,30 +57,20 @@ abstract class SoraRaw :
             else -> null
         }
 
-    // =========================== Catalog Cache ============================
-    private val catalogMutex = Mutex()
-    private var catalogCache: List<MangaEntryDto>? = null
-    private var catalogFetchedAt = 0L
-
-    private suspend fun catalog(): List<MangaEntryDto> = catalogMutex.withLock {
-        catalogCache?.takeIf { System.currentTimeMillis() - catalogFetchedAt < CATALOG_TTL }
-            ?.let { return it }
-
+    // =========================== Catalog ============================
+    private suspend fun catalog(): List<MangaEntryDto> {
         val entries = buildList {
             for (page in 1..MAX_DUMP_PAGES) {
                 val response = client.get("$baseUrl/mangas_$page.json", ensureSuccess = false)
-                if (!response.isSuccessful) break // 404 = documented end-of-catalog marker; other codes (5xx/timeouts) throw
-                val dto = runCatching { json.decodeFromString<MangaListDto>(response.body.string()) }
-                    .getOrElse { break }
+                if (!response.isSuccessful) break
+                val dto = runCatching { response.parseAs<MangaListDto>() }.getOrElse { break }
                 if (dto.list.isEmpty()) break
                 addAll(dto.list)
             }
         }.distinctBy { it.id }
 
         if (entries.isEmpty()) throw Exception("作品一覧の取得に失敗しました。")
-        catalogCache = entries
-        catalogFetchedAt = System.currentTimeMillis()
-        entries
+        return entries
     }
 
     private suspend fun queryCatalog(
@@ -90,6 +81,7 @@ abstract class SoraRaw :
         content: String? = null,
         mode: String? = null,
         genreIds: Set<Long> = emptySet(),
+        excludedGenreIds: Set<Long> = emptySet(),
     ): MangasPage {
         var entries = catalog()
 
@@ -103,7 +95,6 @@ abstract class SoraRaw :
         }
         status?.let { s -> entries = entries.filter { it.type == s } }
         content?.let { c -> entries = entries.filter { it.isAdult == c } }
-        if (genreIds.isNotEmpty()) entries = entries.filter { e -> e.genres.any { it in genreIds } }
 
         entries = when (order) {
             "updated" -> entries.sortedByDescending { it.latestChapterDate.orEmpty() }
@@ -115,6 +106,12 @@ abstract class SoraRaw :
             "horizontal" -> entries = entries.filter { it.mode?.startsWith("horizontal") == true }
             "vertical" -> entries = entries.filter { it.mode == "vertical" }
             else -> Unit
+        }
+
+        if (genreIds.isNotEmpty()) entries = entries.filter { e -> e.genres.any { it in genreIds } }
+
+        if (excludedGenreIds.isNotEmpty()) {
+            entries = entries.filter { e -> e.genres.none { it in excludedGenreIds } }
         }
 
         val from = (page - 1) * PAGE_SIZE
@@ -129,9 +126,19 @@ abstract class SoraRaw :
     }
 
     // ====================== Popular, Latest & Search ======================
-    override suspend fun getPopularManga(page: Int) = queryCatalog(page, order = "views", content = defaultContent)
+    override suspend fun getPopularManga(page: Int) = queryCatalog(
+        page = page,
+        order = "views",
+        content = defaultContent,
+        excludedGenreIds = excludedGenreIds(),
+    )
 
-    override suspend fun getLatestUpdates(page: Int) = queryCatalog(page, order = "updated", content = defaultContent)
+    override suspend fun getLatestUpdates(page: Int) = queryCatalog(
+        page = page,
+        order = "updated",
+        content = defaultContent,
+        excludedGenreIds = excludedGenreIds(),
+    )
 
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList) = queryCatalog(
         page = page,
@@ -144,25 +151,49 @@ abstract class SoraRaw :
             "yes" -> "yes"
             else -> defaultContent
         },
-        genreIds = filters.filterIsInstance<GenreFilter>().firstOrNull()?.selectedId
-            ?.let { setOf(it) } ?: emptySet(),
+        genreIds = filters.findGenreFilters().flatMapTo(mutableSetOf()) { it.selectedIds },
         mode = filters.filterIsInstance<ModeFilter>().firstOrNull()?.selected,
     )
 
     // ============================== Filters ==============================
-    override val supportsFilterFetching = true
+    override val supportsFilterFetching get() = true
 
-    override suspend fun fetchFilterData(): JsonElement = json.parseToJsonElement(client.get("$baseUrl/genres.json").body.string())
+    override suspend fun fetchFilterData(): JsonElement = client.get("$baseUrl/genres.json").parseAs()
 
     override fun getFilterList(data: JsonElement?): FilterList {
-        val genres = data?.let { parseGenres(it) }.orEmpty()
-        return FilterList(
-            GenreFilter(genres),
+        val genreList = data?.let { parseGenres(it) }
+
+        val filters = mutableListOf<Filter<*>>(
             ContentFilter(),
             ModeFilter(),
             OrderFilter(),
             StatusFilter(),
         )
+
+        if (genreList != null) {
+            val genreFilters = mutableListOf<GenreFilter>()
+
+            genreList.sortedByDescending { it.total }
+                .chunked(GENRE_CHUNK_SIZE)
+                .forEachIndexed { index, chunk ->
+                    val from = index * GENRE_CHUNK_SIZE + 1
+                    val to = from + chunk.size - 1
+                    genreFilters.add(GenreFilter("ジャンル $from–$to", chunk))
+                }
+
+            if (genreFilters.isNotEmpty()) {
+                filters.add(GenreGroupFilter(genreFilters.toList()))
+            }
+        }
+
+        return FilterList(filters)
+    }
+
+    private fun FilterList.findGenreFilters(): List<GenreFilter> = flatMap { filter ->
+        when (filter) {
+            is GenreGroupFilter -> filter.state
+            else -> emptyList()
+        }
     }
 
     private fun parseGenres(data: JsonElement): List<GenreDto> {
@@ -174,14 +205,27 @@ abstract class SoraRaw :
         return runCatching { json.decodeFromJsonElement<List<GenreDto>>(array) }.getOrDefault(emptyList())
     }
 
-    private class GenreFilter(genres: List<GenreDto>) :
-        Filter.Select<String>(
-            "ジャンル",
-            (listOf("すべて") + genres.sortedByDescending { it.total }.map { "${it.name} (${it.total})" })
-                .toTypedArray(),
-        ) {
-        private val sorted = genres.sortedByDescending { it.total }
-        val selectedId: Long? get() = if (state == 0) null else sorted[state - 1].id
+    class TriStateFilter(
+        name: String,
+        val value: String = name,
+        state: Int = STATE_IGNORE,
+    ) : TriState(name, state)
+
+    class GenreGroupFilter(
+        state: List<GenreFilter>,
+    ) : Filter.Group<GenreFilter>("ジャンル", state)
+
+    class GenreFilter(
+        name: String,
+        val genreValues: List<GenreDto>,
+    ) : Filter.Group<TriStateFilter>(
+        name = name,
+        state = genreValues.map { genre ->
+            TriStateFilter("${genre.name} (${genre.total})")
+        },
+    ) {
+        val selectedIds: Set<Long> get() =
+            genreValues.filterIndexed { i, _ -> state[i].isIncluded() }.map { it.id }.toSet()
     }
 
     private class ContentFilter :
@@ -320,11 +364,16 @@ abstract class SoraRaw :
 
         val resp = client.get("$manifestBase/$mangaId/${ch.id}.json?t=$t")
         val payload = json.decodeFromString<ImagesResponseDto>(resp.body.string()).d
+        val driveBase = ch.driveBase ?: "https://lh3.googleusercontent.com"
         val entries: List<ManifestEntryDto> = json.decodeFromString(payload.xorDecrypt())
 
         return entries.sortedBy { it.order }.mapIndexed { i, e ->
-            val b = requireNotNull(e.b) { "画像データがありません。" }
-            Page(i, imageUrl = "$host/" + gDecrypt(b, uuidHex))
+            val path = when {
+                e.d != null -> gDecrypt(e.d, uuidHex).let { "$driveBase/$it" }
+                else -> gDecrypt(requireNotNull(e.b) { "画像データがありません。" }, uuidHex)
+                    .let { "$host/$it" }
+            }
+            Page(i, imageUrl = path)
         }
     }
 
@@ -403,16 +452,67 @@ abstract class SoraRaw :
         return Base64.getDecoder().decode(s + "=".repeat((4 - s.length % 4) % 4))
     }
 
+    private fun defaultContentMode(): String = preferences.getString(PREF_DEFAULT_CONTENT, "all")!!
+
+    private fun excludedGenreIds(): Set<Long> {
+        val mode = defaultContentMode()
+        val ids = when (mode) {
+            "general" -> preferences.getStringSet(PREF_EXCLUDE_GENRE_GENERAL, emptySet()).orEmpty()
+            else -> preferences.getStringSet(PREF_EXCLUDE_GENRE_ADULT, emptySet()).orEmpty()
+        }
+        return ids.mapNotNull(String::toLongOrNull).toSet()
+    }
+
     // ============================ Preferences ============================
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        ListPreference(screen.context).apply {
+        val contentPref = ListPreference(screen.context).apply {
             key = PREF_DEFAULT_CONTENT
             title = "既定の表示コンテンツ"
             entries = arrayOf("すべて", "一般のみ", "18+のみ")
             entryValues = arrayOf("all", "general", "adult")
             setDefaultValue("all")
             summary = "%s"
-        }.also(screen::addPreference)
+        }
+        screen.addPreference(contentPref)
+
+        val genres = getFilterList()
+            .findGenreFilters()
+            .flatMap { it.genreValues }
+            .sortedByDescending { it.total }
+
+        val genreEntries = genres.map { "${it.name} (${it.total})" }.toTypedArray()
+        val genreValues = genres.map { it.id.toString() }.toTypedArray()
+        val hasGenres = genreValues.isNotEmpty()
+        val mode = defaultContentMode()
+
+        val generalBlacklist = MultiSelectListPreference(screen.context).apply {
+            key = PREF_EXCLUDE_GENRE_GENERAL
+            title = "ジャンルブラックリスト（一般）"
+            summary = "「一般のみ」閲覧時に除外するジャンル"
+            entries = genreEntries
+            entryValues = genreValues
+            setDefaultValue(emptySet<String>())
+            setEnabled(hasGenres && mode == "general")
+        }
+        screen.addPreference(generalBlacklist)
+
+        val adultBlacklist = MultiSelectListPreference(screen.context).apply {
+            key = PREF_EXCLUDE_GENRE_ADULT
+            title = "ジャンルブラックリスト（18+）"
+            summary = "「すべて」「18+のみ」閲覧時に除外するジャンル"
+            entries = genreEntries
+            entryValues = genreValues
+            setDefaultValue(emptySet<String>())
+            setEnabled(hasGenres && (mode == "all" || mode == "adult"))
+        }
+        screen.addPreference(adultBlacklist)
+
+        contentPref.setOnPreferenceChangeListener { _, newValue ->
+            val newMode = newValue as String
+            generalBlacklist.setEnabled(hasGenres && newMode == "general")
+            adultBlacklist.setEnabled(hasGenres && (newMode == "all" || newMode == "adult"))
+            true
+        }
     }
 
     companion object {
@@ -435,7 +535,11 @@ abstract class SoraRaw :
         private const val CATALOG_TTL = 5 * 60 * 1000L
         private const val MAX_DUMP_PAGES = 200
         private const val PAGE_SIZE = 24
+        private const val GENRE_CHUNK_SIZE = 250
 
         private const val PREF_DEFAULT_CONTENT = "default_content"
+
+        private const val PREF_EXCLUDE_GENRE_GENERAL = "exclude_genre_general"
+        private const val PREF_EXCLUDE_GENRE_ADULT = "exclude_genre_adult"
     }
 }

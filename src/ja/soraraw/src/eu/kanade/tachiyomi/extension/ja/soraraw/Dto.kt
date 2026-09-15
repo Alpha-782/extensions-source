@@ -62,9 +62,10 @@ class ChapterPageDto(
     val id: Long,
     val uuid: String? = null,
     @SerialName("_b") val imageBase: String? = null,
+    @SerialName("_d") val driveBase: String? = null,
     @SerialName("updated_at") val updatedAt: String? = null,
-    val manga: MangaRefDto? = null,
     @SerialName("manga_id") val mangaId: Long? = null,
+    val manga: MangaRefDto? = null,
 )
 
 @Serializable
@@ -74,4 +75,8 @@ class MangaRefDto(val id: Long)
 class ImagesResponseDto(val d: String)
 
 @Serializable
-class ManifestEntryDto(val order: Float = 0f, val b: String? = null)
+class ManifestEntryDto(
+    val order: Float = 0f,
+    val b: String? = null,
+    val d: String? = null, // NEW
+)
