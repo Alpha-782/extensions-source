@@ -10,6 +10,7 @@ keiyoushi {
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
+    // https://soraraw.top has the domain links; soraraw.net domain is blocked inside app
     source {
         lang = "ja"
         baseUrl = "https://soraraw.com"

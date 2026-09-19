@@ -18,7 +18,7 @@ class MangaEntryDto(
     val img: String? = null,
     val mode: String? = null,
     val genres: List<Long> = emptyList(),
-    @SerialName("alt_names") val altNames: String? = null, // comma-separated string here
+    @SerialName("alt_names") val altNames: String? = null,
     @SerialName("c_published") val latestChapterDate: String? = null,
     @SerialName("is_adult") val isAdult: String? = null,
 )
@@ -61,6 +61,8 @@ class ChapterDto(
 class ChapterPageDto(
     val id: Long,
     val uuid: String? = null,
+    val mode: String? = null,
+    val token: String? = null,
     @SerialName("_b") val imageBase: String? = null,
     @SerialName("_d") val driveBase: String? = null,
     @SerialName("updated_at") val updatedAt: String? = null,
@@ -78,5 +80,5 @@ class ImagesResponseDto(val d: String)
 class ManifestEntryDto(
     val order: Float = 0f,
     val b: String? = null,
-    val d: String? = null, // NEW
+    val d: String? = null,
 )

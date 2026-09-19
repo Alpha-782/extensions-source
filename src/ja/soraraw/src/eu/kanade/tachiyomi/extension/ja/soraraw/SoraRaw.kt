@@ -6,6 +6,8 @@ import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.Filter.TriState
+import eu.kanade.tachiyomi.source.model.Filter.TriState.Companion.STATE_EXCLUDE
+import eu.kanade.tachiyomi.source.model.Filter.TriState.Companion.STATE_IGNORE
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -29,6 +31,13 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.HttpUrl
+import okhttp3.Interceptor
+import okhttp3.MediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.time.Instant
@@ -50,6 +59,58 @@ abstract class SoraRaw :
 
     private val preferences by getPreferencesLazy()
 
+    // Intercepts canva image responses and descrambles them on-device.
+    // Fragments never reach the wire; untagged requests pass through untouched.
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = addInterceptor(CanvaDescrambleInterceptor())
+
+    private class CanvaDescrambleInterceptor : Interceptor {
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val request = chain.request()
+            val fragment = request.url.fragment ?: return chain.proceed(request)
+
+            // Tag formats from getPageList:
+            //   "#c<chapterId>:<token>" — canva  (vL/seedrandom pipeline)
+            //   "#w<chapterId>"         — canva2 (wasm nxn pipeline)
+            val bytes: ByteArray
+            val contentType: MediaType?
+            when (fragment.firstOrNull()) {
+                'c' -> {
+                    val parts = fragment.drop(1).split(':', limit = 2)
+                    if (parts.size != 2 || parts[0].toLongOrNull() == null || parts[1].isEmpty()) {
+                        return chain.proceed(request)
+                    }
+                    val response = chain.proceed(stripped(request))
+                    contentType = response.body?.contentType()
+                    bytes = response.body?.bytes() ?: return response
+                    val fixed = runCatching {
+                        CanvaDescrambler.descramble(bytes, parts[0], parts[1])
+                    }.getOrNull() ?: return rawResponse(response, bytes, contentType)
+                    return rawResponse(response, fixed, "image/png".toMediaTypeOrNull())
+                }
+                'w' -> {
+                    val chapterId = fragment.drop(1)
+                    if (chapterId.toLongOrNull() == null) return chain.proceed(request)
+                    val response = chain.proceed(stripped(request))
+                    contentType = response.body?.contentType()
+                    bytes = response.body?.bytes() ?: return response
+                    val fixed = runCatching {
+                        ImageDescrambler.descramble(bytes, chapterId)
+                    }.getOrNull() ?: return rawResponse(response, bytes, contentType)
+                    return rawResponse(response, fixed, "image/png".toMediaTypeOrNull())
+                }
+                else -> return chain.proceed(request)
+            }
+        }
+
+        private fun stripped(request: Request): Request = request.newBuilder()
+            .url(request.url.newBuilder().fragment(null).build())
+            .build()
+
+        private fun rawResponse(response: Response, body: ByteArray, type: MediaType?): Response = response.newBuilder()
+            .body(body.toResponseBody(type))
+            .build()
+    }
+
     private val defaultContent: String?
         get() = when (preferences.getString(PREF_DEFAULT_CONTENT, "all")) {
             "general" -> "no"
@@ -62,7 +123,7 @@ abstract class SoraRaw :
         val entries = buildList {
             for (page in 1..MAX_DUMP_PAGES) {
                 val response = client.get("$baseUrl/mangas_$page.json", ensureSuccess = false)
-                if (!response.isSuccessful) break
+                if (!response.isSuccessful) break // 404 = documented end-of-catalog marker
                 val dto = runCatching { response.parseAs<MangaListDto>() }.getOrElse { break }
                 if (dto.list.isEmpty()) break
                 addAll(dto.list)
@@ -152,6 +213,8 @@ abstract class SoraRaw :
             else -> defaultContent
         },
         genreIds = filters.findGenreFilters().flatMapTo(mutableSetOf()) { it.selectedIds },
+        excludedGenreIds = excludedGenreIds() -
+            filters.findGenreFilters().flatMapTo(mutableSetOf()) { it.selectedIds },
         mode = filters.filterIsInstance<ModeFilter>().firstOrNull()?.selected,
     )
 
@@ -162,6 +225,7 @@ abstract class SoraRaw :
 
     override fun getFilterList(data: JsonElement?): FilterList {
         val genreList = data?.let { parseGenres(it) }
+        val excluded = excludedGenreIds()
 
         val filters = mutableListOf<Filter<*>>(
             ContentFilter(),
@@ -170,15 +234,16 @@ abstract class SoraRaw :
             StatusFilter(),
         )
 
-        if (genreList != null) {
+        if (!genreList.isNullOrEmpty()) {
             val genreFilters = mutableListOf<GenreFilter>()
 
             genreList.sortedByDescending { it.total }
                 .chunked(GENRE_CHUNK_SIZE)
                 .forEachIndexed { index, chunk ->
                     val from = index * GENRE_CHUNK_SIZE + 1
-                    val to = from + chunk.size - 1
-                    genreFilters.add(GenreFilter("ジャンル $from–$to", chunk))
+                    genreFilters.add(
+                        GenreFilter("ジャンル $from–${from + chunk.size - 1}", chunk, excluded),
+                    )
                 }
 
             if (genreFilters.isNotEmpty()) {
@@ -218,10 +283,14 @@ abstract class SoraRaw :
     class GenreFilter(
         name: String,
         val genreValues: List<GenreDto>,
+        val excludedIds: Set<Long> = emptySet(),
     ) : Filter.Group<TriStateFilter>(
         name = name,
         state = genreValues.map { genre ->
-            TriStateFilter("${genre.name} (${genre.total})")
+            TriStateFilter(
+                name = genre.name,
+                state = if (genre.id in excludedIds) STATE_EXCLUDE else STATE_IGNORE,
+            )
         },
     ) {
         val selectedIds: Set<Long> get() =
@@ -350,6 +419,7 @@ abstract class SoraRaw :
         val dataObj = client.get(getChapterUrl(chapter)).asJsoup().nextData().pageProps()["data"]?.jsonObject
             ?: throw Exception("章データの取得に失敗しました。")
 
+        // Some chapters embed images directly
         (dataObj["chapter"]?.jsonObject?.get("images") as? JsonArray)
             ?.takeIf { it.isNotEmpty() }
             ?.let { arr -> return arr.mapIndexedNotNull { i, el -> el.asImageUrl()?.let { Page(i, it) } } }
@@ -357,27 +427,40 @@ abstract class SoraRaw :
         val ch = json.decodeFromJsonElement<ChapterPageDto>(
             dataObj["chapter"]?.jsonObject ?: throw Exception("章データがありません。"),
         )
+
+        // canva chapters are scrambled at source on ALL flavors; the site
+        // descrambles client-side with K = HMAC-SHA256(token, chapterId) —
+        // ported in CanvaDescrambler, applied by the interceptor via fragment tag.
+        // canva2 routes through the site's x8/wasm pipeline instead — not ported.
+        val tag = when (ch.mode) {
+            "canva" -> ch.token?.takeIf { it.isNotBlank() }?.let { "#c${ch.id}:$it" }
+            "canva2" -> "#w${ch.id}"
+            else -> null
+        }.orEmpty()
+
         val uuidHex = ch.uuid ?: throw Exception("復号鍵がありません。")
         val mangaId = ch.manga?.id ?: ch.mangaId ?: throw Exception("作品IDがありません。")
         val host = ch.imageBase ?: "https://lh${ch.id % 4 + 1}.rawcontent.top"
+        val driveBase = ch.driveBase ?: "https://lh3.googleusercontent.com"
         val t = ch.updatedAt?.toEpochMillis() ?: System.currentTimeMillis()
 
         val resp = client.get("$manifestBase/$mangaId/${ch.id}.json?t=$t")
         val payload = json.decodeFromString<ImagesResponseDto>(resp.body.string()).d
-        val driveBase = ch.driveBase ?: "https://lh3.googleusercontent.com"
         val entries: List<ManifestEntryDto> = json.decodeFromString(payload.xorDecrypt())
 
+        // b (rawcontent) preferred — validated descramble path; d (Drive) fallback.
         return entries.sortedBy { it.order }.mapIndexed { i, e ->
-            val path = when {
+            val imageUrl = when {
+                e.b != null -> gDecrypt(e.b, uuidHex).let { "$host/$it" }
                 e.d != null -> gDecrypt(e.d, uuidHex).let { "$driveBase/$it" }
-                else -> gDecrypt(requireNotNull(e.b) { "画像データがありません。" }, uuidHex)
-                    .let { "$host/$it" }
+                else -> throw Exception("画像データがありません。")
             }
-            Page(i, imageUrl = path)
+            Page(i, imageUrl = imageUrl + tag)
         }
     }
 
-    // base64url → Repeating-key XOR → UTF-8 JSON
+    // ============================== Crypto ===============================
+    // Manifest outer layer: base64url → repeating-key XOR → UTF-8 JSON
     private fun String.xorDecrypt(): String {
         val raw = this.decodeB64Flexible()
         val key = MANIFEST_XOR_KEY.toByteArray(Charsets.UTF_8)
@@ -480,7 +563,7 @@ abstract class SoraRaw :
             .flatMap { it.genreValues }
             .sortedByDescending { it.total }
 
-        val genreEntries = genres.map { "${it.name} (${it.total})" }.toTypedArray()
+        val genreEntries = genres.map { it.name }.toTypedArray()
         val genreValues = genres.map { it.id.toString() }.toTypedArray()
         val hasGenres = genreValues.isNotEmpty()
         val mode = defaultContentMode()
@@ -519,20 +602,18 @@ abstract class SoraRaw :
 
         private const val CDN_BASE = "https://i.mangaraw.lat"
 
-        // Reader crypto: Manifest outer layer: base64url + repeating-XOR
+        // Manifest outer layer: base64url + repeating-XOR
         private const val MANIFEST_XOR_KEY = "/fuCkYou!!!"
 
-        // g() image decrypt: b64url(entry.b) XOR pwd → [16B IV | ct] → AES-256-CTR(key = chapter.uuid)
+        // g(): b64url(entry.b) XOR pwd → [16B IV | ct] → AES-256-CTR(key = chapter.uuid)
         private const val IMAGE_PASSWORD = "202508055d0db38bae2e86cc41649f90"
 
-        // settings.d: fnv1a32(pwd + prefix) seeds xorshift32 over base64(rest). Resolves
-        // to the same URL as the fallback; both kept per the site's own `E(d) || apiImage`.
+        // settings.d: E()-encrypted manifest base (resolves to the fallback; both kept
+        // per the site's own `E(d) || apiImage` chain)
         private const val SETTINGS_D = "yDe1Tn9IbseIzyb4Ql++OBHdsm3xBqOL74wfKSAsUzit"
         private const val SETTINGS_PASSWORD = "202508055d0db38bae2e86cc41649f90"
         private const val MANIFEST_FALLBACK = "https://api.mangarawgo.site"
 
-        // Catalog dumps: mangas_1.json … mangas_N.json, 404 = end (site convention)
-        private const val CATALOG_TTL = 5 * 60 * 1000L
         private const val MAX_DUMP_PAGES = 200
         private const val PAGE_SIZE = 24
         private const val GENRE_CHUNK_SIZE = 250
